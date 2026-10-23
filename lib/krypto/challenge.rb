@@ -82,6 +82,17 @@ module Krypto
         true
       end
 
+      # ----------------------------------------------------------------------------
+      def verify_hpke(key)
+        return false unless Krypto::Ec.verify(key, sig, msg)
+
+        @inner = InnerChallengeHPKE.new(MessagePack.unpack(msg))
+
+        true
+      end
+
+      # ----------------------------------------------------------------------------
+
       def timestamp
         @inner&.timestamp
       end
@@ -131,6 +142,46 @@ module Krypto
           challengeId: @inner.challengeId
         )
       end
+
+      # ----------------------------------------------------------------------------
+      def respond_hpke(signing_key, signing_key_2, response_data)
+        raise "No inner. Unverified?" unless @inner
+        raise "not an hpke challenge. Use verify_hpke" unless @inner.is_a?(InnerChallengeHPKE)
+        raise "no hpke public encryption key in challenge" if @inner.xwingPublicKey.nil? || @inner.xwingPublicKey.empty?
+
+        public_signing_key_2_der = if !signing_key_2.nil?
+          Base64.strict_encode64(signing_key_2.public_to_der)
+        else
+          ""
+        end
+
+        msg = MessagePack.pack(
+          Krypto::ChallengeResponse::InnerResponse.new(
+            publicSigningKey: Base64.strict_encode64(signing_key.public_to_der),
+            publicSigningKey2: public_signing_key_2_der,
+            challengeData: @inner.challengeData,
+            responseData: response_data,
+            timestamp: Time.now.to_i
+          )
+        )
+
+        sig = Krypto::Ec.sign(signing_key, msg)
+
+        sig2 = if !signing_key_2.nil?
+          Krypto::Ec.sign(signing_key_2, msg)
+        else
+          ""
+        end
+
+        Krypto::ChallengeResponse::OuterResponseHPKE.new(
+          sig: sig,
+          sig2: sig2,
+          msg: Krypto::HPKE.seal(msg, @inner.xwingPublicKey, HPKE_RESPONSE_INFO),
+          challengeId: @inner.challengeId
+        )
+      end
+
+      # ----------------------------------------------------------------------------
     end
 
     INNER_CHALLENGE_FIELDS = %i[publicEncryptionKey challengeData requestData timestamp challengeId].freeze
