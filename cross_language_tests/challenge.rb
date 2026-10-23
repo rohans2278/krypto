@@ -70,6 +70,35 @@ when "open_response_png"
     )
   )
 
+# ----------------------------------------------------------------------------
+when "generate_hpke"
+  key = OpenSSL::PKey::EC.new(test_case["RubyPrivateSigningKey"])
+  result = Krypto::Challenge.generate_hpke(key, test_case["ChallengeId"], test_case["ChallengeData"], test_case["RequestData"], timestamp: Time.now)
+  File.write(private_encryption_key_path, Base64.strict_encode64(result[1]))
+
+  puts(Base64.strict_encode64(MessagePack.pack(result[0])))
+
+# ----------------------------------------------------------------------------
+when "respond_hpke"
+  signing_key = OpenSSL::PKey::EC.generate("prime256v1")
+  signing_key_2 = OpenSSL::PKey::EC.generate("prime256v1")
+  counter_party = OpenSSL::PKey::EC.new(test_case["ChallengerPublicKey"])
+  outer_challenge = Krypto::Challenge::OuterChallenge.new(MessagePack.unpack(test_case["ChallengePack"]))
+
+  if !outer_challenge.verify_hpke(counter_party)
+    raise "challenge verification failed"
+  end
+
+  puts(Base64.strict_encode64(MessagePack.pack(outer_challenge.respond_hpke(signing_key, signing_key_2, test_case["ResponseData"]))))
+
+# ----------------------------------------------------------------------------
+when "open_response_png_hpke"
+  private_encryption_key = Base64.strict_decode64(File.read(private_encryption_key_path))
+  challenge_response = Krypto::ChallengeResponse.unmarshal_hpke(test_case["ResponsePack"], png: true, base64: false)
+
+  puts(Base64.strict_encode64(MessagePack.pack(challenge_response.open(private_encryption_key))))
+
+# ----------------------------------------------------------------------------
 else
   puts "What are we doing here?"
   exit(1)

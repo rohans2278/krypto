@@ -7,6 +7,7 @@ gem "chunky_png", git: "https://github.com/kolide/chunky_png"
 gemspec
 
 group :test do
+  gem "base64"
   gem "minitest", "~> 5.0"
   gem "rake", "~> 13.0"
   gem "rake-compiler", "~> 1.2"

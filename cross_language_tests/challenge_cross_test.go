@@ -395,3 +395,267 @@ func tamperWithPngResponse(t *testing.T, challengeBytes, pngResponseBytes []byte
 
 	return pngBuf.Bytes()
 }
+
+// ---------------------------------------------------------
+func TestChallengeHPKE_RubyGenerate_GoRespondPng(t *testing.T) {
+	t.Parallel()
+
+	//nolint: paralleltest
+	for _, challengeData := range testChallenges(t) {
+		dir := t.TempDir()
+
+		rubyPrivateSigningKey := ecdsaKey(t)
+		challengeId := []byte(ulid.New())
+		requestData := []byte(ulid.New())
+
+		var challengeOuterBoxBytes []byte
+
+		t.Run("ruby creates challenge", func(t *testing.T) {
+			rubyChallengeCmdData := rubyChallengeCmd{
+				RubyPrivateSigningKey: privateEcKeyToPem(t, rubyPrivateSigningKey),
+				ChallengeData:         challengeData,
+				ChallengeId:           challengeId,
+				RequestData:           requestData,
+			}
+
+			out, err := rubyChallengeExec("generate_hpke", dir, rubyChallengeCmdData)
+			require.NoError(t, err, string(out))
+			challengeOuterBoxBytes = out
+		})
+
+		t.Run("go receives tampered with challenge and fails to verify", func(t *testing.T) {
+			outerChallenge, err := challenge.UnmarshalChallenge(tamperWithChallengeHPKE(t, challengeOuterBoxBytes))
+			require.NoError(t, err)
+
+			require.ErrorContains(t, outerChallenge.Verify(rubyPrivateSigningKey.PublicKey), "invalid signature", "should get an eror due to tampering")
+		})
+
+		var outerResponsePngBytes []byte
+		responderData := []byte(ulid.New())
+
+		t.Run("go receives legit challenge and creates response png", func(t *testing.T) {
+			challengeOuterBox, err := challenge.UnmarshalChallenge(challengeOuterBoxBytes)
+			require.NoError(t, err)
+
+			responderPrivateSigningKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			require.NoError(t, err)
+
+			responderPrivateSigningKey2, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			require.NoError(t, err)
+
+			require.Empty(t, challengeOuterBox.RequestData())
+			require.Equal(t, challengeOuterBox.Timestamp(), int64(-1))
+
+			_, err = challengeOuterBox.RespondHPKE(responderPrivateSigningKey, responderPrivateSigningKey2, responderData)
+			require.Error(t, err)
+
+			malloryPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			require.NoError(t, err)
+			require.Error(t, challengeOuterBox.Verify(malloryPrivateKey.PublicKey))
+
+			require.NoError(t, challengeOuterBox.Verify(rubyPrivateSigningKey.PublicKey))
+
+			require.WithinDuration(t, time.Now(), time.Unix(challengeOuterBox.Timestamp(), 0), time.Second*5)
+			require.Equal(t, requestData, challengeOuterBox.RequestData())
+
+			_, err = challengeOuterBox.RespondHPKE(responderPrivateSigningKey, nil, responderData)
+			require.NoError(t, err)
+
+			outerResponseBytes, err := challengeOuterBox.RespondHPKE(responderPrivateSigningKey, responderPrivateSigningKey2, responderData)
+			require.NoError(t, err)
+
+			var pngBuf bytes.Buffer
+			require.NoError(t, krypto.ToPng(&pngBuf, outerResponseBytes))
+			outerResponsePngBytes = pngBuf.Bytes()
+		})
+
+		t.Run("ruby receives tampered with response, fails to verify", func(t *testing.T) {
+			rubyChallengeCmdData := rubyChallengeCmd{
+				ResponsePack: tamperWithPngResponseHPKE(t, challengeOuterBoxBytes, outerResponsePngBytes),
+			}
+
+			out, err := rubyChallengeExec("open_response_png_hpke", dir, rubyChallengeCmdData)
+			require.Error(t, err)
+			require.Contains(t, string(out), "invalid signature")
+		})
+
+		t.Run("ruby handles legit response", func(t *testing.T) {
+			rubyChallengeCmdData := rubyChallengeCmd{
+				ResponsePack: outerResponsePngBytes,
+			}
+
+			var out bytes.Buffer
+			require.NoError(t, krypto.FromPng(bytes.NewBuffer(outerResponsePngBytes), &out))
+			responseBox, err := challenge.UnmarshalResponseHPKE(out.Bytes())
+			require.NoError(t, err)
+			require.Equal(t, challengeId, responseBox.ChallengeId)
+
+			rubyOut, err := rubyChallengeExec("open_response_png_hpke", dir, rubyChallengeCmdData)
+			require.NoError(t, err, string(rubyOut))
+
+			var innerResponse challenge.InnerResponse
+			require.NoError(t, msgpack.Unmarshal(rubyOut, &innerResponse))
+
+			require.Equal(t, challengeData, innerResponse.ChallengeData)
+			require.Equal(t, responderData, innerResponse.ResponseData)
+			require.WithinDuration(t, time.Now(), time.Unix(innerResponse.Timestamp, 0), rubyCmdTimeout)
+		})
+	}
+}
+
+//---------------------------------------------------------
+
+// ---------------------------------------------------------
+func TestChallengeHPKE_GoGenerate_RubyRespond(t *testing.T) {
+	t.Parallel()
+
+	//nolint: paralleltest
+	for _, challengeData := range testChallenges(t) {
+		dir := t.TempDir()
+
+		goPrivateSigningKey := ecdsaKey(t)
+		challengeId := []byte(ulid.New())
+		requestData := []byte(ulid.New())
+
+		var challengeOuterBoxBytes []byte
+		var challengePrivateEncryptionKey []byte
+
+		t.Run("go creates challenge", func(t *testing.T) {
+			out, key, err := challenge.GenerateHPKE(goPrivateSigningKey, challengeId, challengeData, requestData)
+			require.NoError(t, err)
+
+			challengeOuterBoxBytes = out
+			challengePrivateEncryptionKey = key
+		})
+
+		var outerResponseBytes []byte
+		responderData := []byte(ulid.New())
+
+		t.Run("ruby receives tampered with challenge and and fails to verify", func(t *testing.T) {
+			rubyChallengeCmdData := rubyChallengeCmd{
+				ChallengerPublicKey: publicEcKeyToPem(t, &goPrivateSigningKey.PublicKey),
+				ChallengePack:       tamperWithChallengeHPKE(t, challengeOuterBoxBytes),
+				ResponseData:        responderData,
+			}
+			out, err := rubyChallengeExec("respond_hpke", dir, rubyChallengeCmdData)
+			require.Error(t, err, string(out))
+			require.Contains(t, string(out), "verification failed")
+		})
+
+		t.Run("ruby receives challenge and creates response", func(t *testing.T) {
+			rubyChallengeCmdData := rubyChallengeCmd{
+				ChallengerPublicKey: publicEcKeyToPem(t, &goPrivateSigningKey.PublicKey),
+				ChallengePack:       challengeOuterBoxBytes,
+				ResponseData:        responderData,
+			}
+			out, err := rubyChallengeExec("respond_hpke", dir, rubyChallengeCmdData)
+			require.NoError(t, err, string(out))
+
+			outerResponseBytes = out
+		})
+
+		t.Run("go recives tampered with response and fails to verify", func(t *testing.T) {
+			outerResponse, err := challenge.UnmarshalResponseHPKE(tamperWithResponseHPKE(t, challengeOuterBoxBytes, outerResponseBytes))
+			require.NoError(t, err)
+
+			_, err = outerResponse.Open(challengePrivateEncryptionKey)
+			require.Error(t, err)
+		})
+
+		t.Run("go handles legit response", func(t *testing.T) {
+			outerResponse, err := challenge.UnmarshalResponseHPKE(outerResponseBytes)
+			require.NoError(t, err)
+
+			require.Equal(t, challengeId, outerResponse.ChallengeId)
+
+			_, malloryPrivKey, err := challenge.GenerateHPKE(goPrivateSigningKey, challengeId, challengeData, requestData)
+			require.NoError(t, err)
+			_, err = outerResponse.Open(malloryPrivKey)
+			require.Error(t, err)
+
+			innerResponse, err := outerResponse.Open(challengePrivateEncryptionKey)
+			require.NoError(t, err)
+
+			require.Equal(t, challengeData, innerResponse.ChallengeData)
+			require.Equal(t, responderData, innerResponse.ResponseData)
+			require.WithinDuration(t, time.Now(), time.Unix(innerResponse.Timestamp, 0), time.Second*5)
+		})
+	}
+}
+
+//---------------------------------------------------------
+
+// ---------------------------------------------------------
+func tamperWithChallengeHPKE(t *testing.T, challengeBytes []byte) []byte {
+	challengeBox, err := challenge.UnmarshalChallenge(challengeBytes)
+	require.NoError(t, err)
+
+	var innerChallenge challenge.InnerChallengeHPKE
+	require.NoError(t, msgpack.Unmarshal(challengeBox.Msg, &innerChallenge))
+
+	innerChallenge.RequestData = []byte("do something evil!")
+
+	challengeBox.Msg, err = msgpack.Marshal(innerChallenge)
+	require.NoError(t, err)
+
+	tamperedChallengeOuterBoxBytes, err := challengeBox.Marshal()
+	require.NoError(t, err)
+
+	return tamperedChallengeOuterBoxBytes
+}
+
+//---------------------------------------------------------
+
+// ---------------------------------------------------------
+func tamperWithResponseHPKE(t *testing.T, challengeBytes, responseBytes []byte) []byte {
+	malloryKey := ecdsaKey(t)
+
+	malloryKeyDerBytes, err := x509.MarshalPKIXPublicKey(&malloryKey.PublicKey)
+	require.NoError(t, err)
+
+	malloryB64Der := base64.StdEncoding.EncodeToString(malloryKeyDerBytes)
+
+	outerChallenge, err := challenge.UnmarshalChallenge(challengeBytes)
+	require.NoError(t, err)
+
+	var innerChallenge challenge.InnerChallengeHPKE
+	require.NoError(t, msgpack.Unmarshal(outerChallenge.Msg, &innerChallenge))
+
+	innerResponseBytes, err := msgpack.Marshal(challenge.InnerResponse{
+		PublicSigningKey:  []byte(malloryB64Der),
+		PublicSigningKey2: []byte(malloryB64Der),
+		ChallengeData:     innerChallenge.ChallengeData,
+		ResponseData:      []byte("evil response data"),
+		Timestamp:         time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	sealed, err := echelper.SealHPKE(innerResponseBytes, innerChallenge.XWingPublicKey, []byte("x-wing-hpke-response"))
+	require.NoError(t, err)
+
+	outerResponse, err := challenge.UnmarshalResponseHPKE(responseBytes)
+	require.NoError(t, err)
+
+	outerResponse.Msg = sealed
+
+	tamperedBytes, err := msgpack.Marshal(outerResponse)
+	require.NoError(t, err)
+
+	return tamperedBytes
+}
+
+//---------------------------------------------------------
+
+// ---------------------------------------------------------
+func tamperWithPngResponseHPKE(t *testing.T, challengeBytes, pngResponseBytes []byte) []byte {
+	in := bytes.NewBuffer(pngResponseBytes)
+	var out bytes.Buffer
+	require.NoError(t, krypto.FromPng(in, &out))
+
+	var pngBuf bytes.Buffer
+	require.NoError(t, krypto.ToPng(&pngBuf, tamperWithResponseHPKE(t, challengeBytes, out.Bytes())))
+
+	return pngBuf.Bytes()
+}
+
+//---------------------------------------------------------
