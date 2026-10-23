@@ -1,9 +1,11 @@
 package challenge
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hpke"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kolide/kit/ulid"
+	"github.com/kolide/krypto"
 	"github.com/kolide/krypto/pkg/echelper"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/nacl/box"
@@ -121,6 +124,128 @@ func TestChallengeHappyPath(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------
+func TestChallengeHappyPathHPKE(t *testing.T) {
+	t.Parallel()
+
+	challengerPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	challengeId := []byte(ulid.New())
+	challengeData := []byte(ulid.New())
+	requestData := []byte(ulid.New())
+
+	var (
+		challengeOuterBoxBytes        []byte
+		challengePrivateEncryptionKey []byte
+	)
+
+	//nolint: paralleltest
+	t.Run("challenger creates challenge", func(t *testing.T) {
+		_, _, err := GenerateHPKE(timeoutSigner{}, challengeId, challengeData, requestData)
+		require.Error(t, err)
+
+		challengeOuterBoxBytes, challengePrivateEncryptionKey, err = GenerateHPKE(challengerPrivateKey, challengeId, challengeData, requestData)
+		require.NoError(t, err)
+	})
+
+	var (
+		challengeResponsePngBytesSingleSigner []byte
+		challengeResponsePngBytesDoubleSigner []byte
+	)
+
+	responderData := []byte(ulid.New())
+
+	//nolint: paralleltest
+	t.Run("responder receives challenge and creates response", func(t *testing.T) {
+		challengeOuterBox, err := UnmarshalChallenge(challengeOuterBoxBytes)
+		require.NoError(t, err)
+
+		responderPrivateSigningKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+
+		responderPrivateSigningKey2, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+
+		require.Empty(t, challengeOuterBox.RequestData())
+		require.Equal(t, challengeOuterBox.Timestamp(), int64(-1))
+
+		_, err = challengeOuterBox.RespondHPKE(responderPrivateSigningKey, responderPrivateSigningKey2, responderData)
+		require.Error(t, err)
+
+		malloryPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+		require.Error(t, challengeOuterBox.Verify(malloryPrivateKey.PublicKey))
+
+		require.NoError(t, challengeOuterBox.Verify(challengerPrivateKey.PublicKey))
+
+		require.WithinDuration(t, time.Now(), time.Unix(challengeOuterBox.Timestamp(), 0), time.Second*5)
+		require.Equal(t, requestData, challengeOuterBox.RequestData())
+
+		_, err = challengeOuterBox.RespondHPKE(timeoutSigner{}, nil, responderData)
+		require.Error(t, err)
+
+		challengeResponseBytesSingleSigner, err := challengeOuterBox.RespondHPKE(responderPrivateSigningKey, nil, responderData)
+		require.NoError(t, err)
+
+		var challengeResponsePngSingleSigner bytes.Buffer
+		require.NoError(t, krypto.ToPng(&challengeResponsePngSingleSigner, challengeResponseBytesSingleSigner))
+		challengeResponsePngBytesSingleSigner = challengeResponsePngSingleSigner.Bytes()
+
+		challengeResponseBytesDoubleSigner, err := challengeOuterBox.RespondHPKE(responderPrivateSigningKey, responderPrivateSigningKey2, responderData)
+		require.NoError(t, err)
+
+		var challengeResponsePngDoubleSigner bytes.Buffer
+		require.NoError(t, krypto.ToPng(&challengeResponsePngDoubleSigner, challengeResponseBytesDoubleSigner))
+		challengeResponsePngBytesDoubleSigner = challengeResponsePngDoubleSigner.Bytes()
+	})
+
+	//nolint: paralleltest
+	t.Run("responder rejects challenge without x-wing key", func(t *testing.T) {
+		naclChallengeBytes, _, err := Generate(challengerPrivateKey, challengeId, challengeData, requestData)
+		require.NoError(t, err)
+
+		naclChallengeOuterBox, err := UnmarshalChallenge(naclChallengeBytes)
+		require.NoError(t, err)
+		require.NoError(t, naclChallengeOuterBox.Verify(challengerPrivateKey.PublicKey))
+
+		responderPrivateSigningKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+
+		_, err = naclChallengeOuterBox.RespondHPKE(responderPrivateSigningKey, nil, responderData)
+		require.ErrorContains(t, err, "no hpke public encryption key in challenge")
+	})
+
+	//nolint: paralleltest
+	t.Run("challenger handles response", func(t *testing.T) {
+		for _, responsePngBytes := range [][]byte{challengeResponsePngBytesSingleSigner, challengeResponsePngBytesDoubleSigner} {
+			var responseBytes bytes.Buffer
+			require.NoError(t, krypto.FromPng(bytes.NewBuffer(responsePngBytes), &responseBytes))
+
+			outerResponse, err := UnmarshalResponseHPKE(responseBytes.Bytes())
+			require.NoError(t, err)
+
+			require.Equal(t, challengeId, outerResponse.ChallengeId)
+
+			malloryPrivKey, err := hpke.MLKEM768X25519().GenerateKey()
+			require.NoError(t, err)
+			malloryPrivKeyBytes, err := malloryPrivKey.Bytes()
+			require.NoError(t, err)
+			_, err = outerResponse.Open(malloryPrivKeyBytes)
+			require.Error(t, err)
+
+			innerResponse, err := outerResponse.Open(challengePrivateEncryptionKey)
+			require.NoError(t, err)
+
+			require.Equal(t, challengeData, innerResponse.ChallengeData)
+			require.Equal(t, responderData, innerResponse.ResponseData)
+			require.WithinDuration(t, time.Now(), time.Unix(innerResponse.Timestamp, 0), time.Second*5)
+		}
+	})
+}
+
+//---------------------------------------------------------
 
 // TestVerifyWithKeyBytes makes sure krypto can handle pem and b64 der format
 func TestVerifyWithKeyBytes(t *testing.T) {
