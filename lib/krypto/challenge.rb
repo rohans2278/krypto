@@ -7,16 +7,16 @@ require "openssl"
 module Krypto
   # Limit size to prevent garbage from filling memory
   MAX_CHALLENGE_SIZE = 4 * 1024 * 1024
+  HPKE_RESPONSE_INFO = "x-wing-hpke-response"
 
   class Challenge
     def self.generate(signing_key, challenge_id, challenge_data, request_data, timestamp: Time.now)
       private_encryption_key = RbNaCl::PrivateKey.generate
       public_encryption_key = private_encryption_key.public_key
-      # !! Replace here with X-Wing keygen
 
       msg = MessagePack.pack(
         InnerChallenge.new(
-          publicEncryptionKey: public_encryption_key.to_bytes, # !! Needs to be X-Wing
+          publicEncryptionKey: public_encryption_key.to_bytes,
           challengeData: challenge_data,
           requestData: request_data,
           timestamp: timestamp.to_i,

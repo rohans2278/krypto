@@ -17,6 +17,20 @@ module Krypto
       OuterResponse.new(MessagePack.unpack(data))
     end
 
+    # ----------------------------------------------------------------------------
+    def self.unmarshal_hpke(data, png: false, base64: true)
+      if data.size > MAX_CHALLENGE_SIZE
+        raise "response too large"
+      end
+
+      data = ::Krypto::Png.decode_blob(data) if png
+      data = Base64.strict_decode64(data) if base64
+
+      OuterResponseHPKE.new(MessagePack.unpack(data))
+    end
+
+    # ----------------------------------------------------------------------------
+
     OUTER_RESPONSE_FIELDS = %i[publicEncryptionKey sig sig2 msg challengeId].freeze
     class OuterResponse < Struct.new(*OUTER_RESPONSE_FIELDS, keyword_init: true)
       def to_msgpack(out = "")
@@ -58,6 +72,36 @@ module Krypto
         raise "invalid signature" unless Krypto::Ec.verify(key, signature, data)
       end
     end
+
+    # ----------------------------------------------------------------------------
+    OUTER_RESPONSE_HPKE_FIELDS = %i[sig sig2 msg challengeId].freeze
+    class OuterResponseHPKE < Struct.new(*OUTER_RESPONSE_HPKE_FIELDS, keyword_init: true)
+      def to_msgpack(out = "")
+        to_h.to_msgpack(out)
+      end
+
+      def open(private_encryption_key)
+        opened = Krypto::HPKE.open(msg, private_encryption_key, HPKE_RESPONSE_INFO)
+        inner = InnerResponse.new(MessagePack.unpack(opened))
+
+        OuterResponse.verify_with_key_bytes(inner.publicSigningKey, sig, opened)
+
+        if sig2.nil? || sig2.empty?
+          inner.publicSigningKey2 = nil
+          return inner
+        end
+
+        if inner.publicSigningKey2.nil? || inner.publicSigningKey2.empty?
+          raise "have signature 2, but no public signing key 2"
+        end
+
+        OuterResponse.verify_with_key_bytes(inner.publicSigningKey2, sig2, opened)
+
+        inner
+      end
+    end
+
+    # ----------------------------------------------------------------------------
 
     INNER_RESPONSE_FIELDS = %i[publicSigningKey publicSigningKey2 challengeData responseData timestamp].freeze
     class InnerResponse < Struct.new(*INNER_RESPONSE_FIELDS, keyword_init: true)
