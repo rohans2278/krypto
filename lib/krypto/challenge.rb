@@ -12,10 +12,11 @@ module Krypto
     def self.generate(signing_key, challenge_id, challenge_data, request_data, timestamp: Time.now)
       private_encryption_key = RbNaCl::PrivateKey.generate
       public_encryption_key = private_encryption_key.public_key
+      # !! Replace here with X-Wing keygen
 
       msg = MessagePack.pack(
         InnerChallenge.new(
-          publicEncryptionKey: public_encryption_key.to_bytes,
+          publicEncryptionKey: public_encryption_key.to_bytes, # !! Needs to be X-Wing
           challengeData: challenge_data,
           requestData: request_data,
           timestamp: timestamp.to_i,
@@ -30,6 +31,30 @@ module Krypto
 
       [outer, private_encryption_key.to_bytes]
     end
+
+    # ----------------------------------------------------------------------------
+    def self.generate_hpke(signing_key, challenge_id, challenge_data, request_data, timestamp: Time.now)
+      private_encryption_key, public_encryption_key = Krypto::HPKE.generate_key_pair
+
+      msg = MessagePack.pack(
+        InnerChallengeHPKE.new(
+          xwingPublicKey: public_encryption_key,
+          challengeData: challenge_data,
+          requestData: request_data,
+          timestamp: timestamp.to_i,
+          challengeId: challenge_id
+        )
+      )
+
+      outer = OuterChallenge.new(
+        sig: signing_key.sign(OpenSSL::Digest.new("SHA256"), msg),
+        msg: msg
+      )
+
+      [outer, private_encryption_key]
+    end
+
+    # ----------------------------------------------------------------------------
 
     def self.unmarshal(data, png: false, base64: true)
       # Limit size to prevent garbage from filling memory
@@ -114,5 +139,15 @@ module Krypto
         to_h.to_msgpack(out)
       end
     end
+
+    # ----------------------------------------------------------------------------
+    INNER_CHALLENGE_HPKE_FIELDS = %i[xwingPublicKey challengeData requestData timestamp challengeId].freeze
+    class InnerChallengeHPKE < Struct.new(*INNER_CHALLENGE_HPKE_FIELDS, keyword_init: true)
+      def to_msgpack(out = "")
+        to_h.to_msgpack(out)
+      end
+    end
+
+    # ----------------------------------------------------------------------------
   end
 end
