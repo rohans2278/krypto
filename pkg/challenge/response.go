@@ -21,6 +21,15 @@ type OuterResponse struct {
 	ChallengeId         []byte   `msgpack:"challengeId"`
 }
 
+// ---------------------------------------------------------
+type OuterResponseHPKE struct {
+	Sig         []byte `msgpack:"sig"`
+	Sig2        []byte `msgpack:"sig2"`
+	Msg         []byte `msgpack:"msg"`
+	ChallengeId []byte `msgpack:"challengeId"`
+}
+//---------------------------------------------------------
+
 func (o *OuterResponse) Open(privateEncryptionKey *[32]byte) (*InnerResponse, error) {
 	innerResponseBytes, err := echelper.OpenNaCl(o.Msg, &o.PublicEncryptionKey, privateEncryptionKey)
 	if err != nil {
@@ -55,6 +64,40 @@ func (o *OuterResponse) Open(privateEncryptionKey *[32]byte) (*InnerResponse, er
 
 	return &innerResponse, nil
 }
+
+// ---------------------------------------------------------
+func (o *OuterResponseHPKE) Open(privateEncryptionKey []byte) (*InnerResponse, error) {
+	innerResponseBytes, err := echelper.OpenHPKE(o.Msg, privateEncryptionKey, []byte(hpkeResponseInfo))
+	if err != nil {
+		return nil, fmt.Errorf("opening challenge response hpke box: %w", err)
+	}
+
+	var innerResponse InnerResponse
+	if err := msgpack.Unmarshal(innerResponseBytes, &innerResponse); err != nil {
+		return nil, fmt.Errorf("unmarshaling inner box: %w", err)
+	}
+
+	if err := verifyWithKeyBytes(innerResponse.PublicSigningKey, innerResponseBytes, o.Sig); err != nil {
+		return nil, fmt.Errorf("verifying challenge signature: %w", err)
+	}
+
+	if len(o.Sig2) <= 0 {
+		innerResponse.PublicSigningKey2 = nil
+		return &innerResponse, nil
+	}
+
+	if len(innerResponse.PublicSigningKey2) <= 0 {
+		return nil, fmt.Errorf("have signature 2 but no public signing key 2")
+	}
+
+	if err := verifyWithKeyBytes(innerResponse.PublicSigningKey2, innerResponseBytes, o.Sig2); err != nil {
+		return nil, fmt.Errorf("verifying challenge signature 2: %w", err)
+	}
+
+	return &innerResponse, nil
+}
+
+//---------------------------------------------------------
 
 func verifyWithKeyBytes(keyBytes []byte, msg []byte, sig []byte) error {
 	var (
@@ -94,6 +137,21 @@ func UnmarshalResponse(outerResponseBytes []byte) (*OuterResponse, error) {
 	}
 	return &outerResponse, nil
 }
+
+// ---------------------------------------------------------
+func UnmarshalResponseHPKE(outerResponseBytes []byte) (*OuterResponseHPKE, error) {
+	if len(outerResponseBytes) > krypto.V0MaxSize {
+		return nil, fmt.Errorf("response to large: is %d, max is %d", len(outerResponseBytes), krypto.V0MaxSize)
+	}
+
+	var outerResponse OuterResponseHPKE
+	if err := msgpack.Unmarshal(outerResponseBytes, &outerResponse); err != nil {
+		return nil, err
+	}
+	return &outerResponse, nil
+}
+
+//---------------------------------------------------------
 
 func UnmarshalResponsePng(outerResponsePngBytes []byte) (*OuterResponse, error) {
 	var out bytes.Buffer
