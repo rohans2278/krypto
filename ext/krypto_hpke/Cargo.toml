@@ -1,0 +1,12 @@
+[package]
+name = "krypto_hpke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = "0.9.3"
+hpke = { version = "0.14.1", default-features = false, features = ["mlkem", "x25519", "hkdfsha2", "aes", "getrandom", "alloc"] }

@@ -9,6 +9,7 @@ gemspec
 group :test do
   gem "minitest", "~> 5.0"
   gem "rake", "~> 13.0"
+  gem "rake-compiler", "~> 1.2"
   gem "simplecov", "~> 0.16"
   gem "standard", "~> 1.3"
   gem "rbnacl", "~> 7.1"
