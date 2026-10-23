@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/hpke"
 	"crypto/rand"
 	"fmt"
 	"time"
@@ -17,6 +18,7 @@ import (
 const (
 	signingTimeoutDuration = 1 * time.Second
 	signingTimeoutInterval = 250 * time.Millisecond
+	hpkeResponseInfo       = "x-wing-hpke-response"
 )
 
 type OuterChallenge struct {
@@ -132,6 +134,84 @@ func (o *OuterChallenge) Respond(signer crypto.Signer, signer2 crypto.Signer, re
 	return msgpack.Marshal(outerResponse)
 }
 
+// ---------------------------------------------------------
+func (o *OuterChallenge) RespondHPKE(signer crypto.Signer, signer2 crypto.Signer, responseData []byte) ([]byte, error) {
+	if o.innerChallenge == nil {
+		return nil, fmt.Errorf("no inner. unverified?")
+	}
+
+	var innerChallenge InnerChallengeHPKE
+	if err := msgpack.Unmarshal(o.Msg, &innerChallenge); err != nil {
+		return nil, fmt.Errorf("unmarshaling hpke inner challenge: %w", err)
+	}
+
+	if len(innerChallenge.XWingPublicKey) == 0 {
+		return nil, fmt.Errorf("no hpke public encryption key in challenge")
+	}
+
+	ecdsaPubKey, ok := signer.Public().(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("signer pubkey in unexpected format (expected ECDSA, got %T)", signer.Public())
+	}
+
+	pubSigningDer, err := echelper.PublicEcdsaToB64Der(ecdsaPubKey)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling public signing key to der: %w", err)
+	}
+
+	var pubSigningKey2Der []byte
+	if signer2 != nil {
+		ecdsaPubKey2, ok := signer2.Public().(*ecdsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("signer pubkey 2 in unexpected format (expected ECDSA, got %T)", signer2.Public())
+		}
+
+		pubSigningKey2Der, err = echelper.PublicEcdsaToB64Der(ecdsaPubKey2)
+		if err != nil {
+			return nil, fmt.Errorf("marshalling public signing 2 key to der: %w", err)
+		}
+	}
+
+	innerResponse, err := msgpack.Marshal(InnerResponse{
+		PublicSigningKey:  pubSigningDer,
+		PublicSigningKey2: pubSigningKey2Der,
+		ChallengeData:     innerChallenge.ChallengeData,
+		ResponseData:      responseData,
+		Timestamp:         time.Now().Unix(),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("marshaling inner box: %w", err)
+	}
+
+	signature, err := echelper.SignWithTimeout(signer, innerResponse, signingTimeoutDuration, signingTimeoutInterval)
+	if err != nil {
+		return nil, fmt.Errorf("signing challenge: %w", err)
+	}
+
+	var signature2 []byte
+	if signer2 != nil {
+		//nolint: errcheck - we allow nil signer2
+		signature2, _ = echelper.SignWithTimeout(signer2, innerResponse, signingTimeoutDuration, signingTimeoutInterval)
+	}
+
+	sealed, err := echelper.SealHPKE(innerResponse, innerChallenge.XWingPublicKey, []byte(hpkeResponseInfo))
+	if err != nil {
+		return nil, fmt.Errorf("sealing challenge inner hpke box: %w", err)
+	}
+
+	outerResponse := &OuterResponseHPKE{
+		Sig:         signature,
+		Sig2:        signature2,
+		Msg:         sealed,
+		ChallengeId: innerChallenge.ChallengeId,
+	}
+
+	return msgpack.Marshal(outerResponse)
+}
+
+//---------------------------------------------------------
+
 func (o *OuterChallenge) inner() (*InnerChallenge, error) {
 	if o.Msg == nil {
 		return nil, fmt.Errorf("inner is nil")
@@ -180,6 +260,17 @@ type InnerChallenge struct {
 	ChallengeId         []byte   `msgpack:"challengeId"`
 }
 
+// ---------------------------------------------------------
+type InnerChallengeHPKE struct {
+	XWingPublicKey []byte `msgpack:"xwingPublicKey"`
+	ChallengeData  []byte `msgpack:"challengeData"`
+	RequestData    []byte `msgpack:"requestData"`
+	Timestamp      int64  `msgpack:"timestamp"`
+	ChallengeId    []byte `msgpack:"challengeId"`
+}
+
+//---------------------------------------------------------
+
 func Generate(signer crypto.Signer, challengeId []byte, challengeData []byte, requestData []byte) ([]byte, *[32]byte, error) {
 	pubEncKey, privEncKey, err := box.GenerateKey(rand.Reader)
 	if err != nil {
@@ -215,3 +306,47 @@ func Generate(signer crypto.Signer, challengeId []byte, challengeData []byte, re
 
 	return outerChallengeBytes, privEncKey, nil
 }
+
+// ---------------------------------------------------------
+func GenerateHPKE(signer crypto.Signer, challengeId []byte, challengeData []byte, requestData []byte) ([]byte, []byte, error) {
+	privEncKey, err := hpke.MLKEM768X25519().GenerateKey()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generating x-wing encryption keys: %w", err)
+	}
+
+	privEncKeyBytes, err := privEncKey.Bytes()
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshaling x-wing private key: %w", err)
+	}
+
+	inner, err := msgpack.Marshal(InnerChallengeHPKE{
+		XWingPublicKey: privEncKey.PublicKey().Bytes(),
+		ChallengeData:  challengeData,
+		Timestamp:      time.Now().Unix(),
+		ChallengeId:    challengeId,
+		RequestData:    requestData,
+	})
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshaling hpke inner challenge box: %w", err)
+	}
+
+	signature, err := echelper.SignWithTimeout(signer, inner, signingTimeoutDuration, signingTimeoutInterval)
+	if err != nil {
+		return nil, nil, fmt.Errorf("signing challenge: %w", err)
+	}
+
+	outerChallenge := &OuterChallenge{
+		Sig: signature,
+		Msg: inner,
+	}
+
+	outerChallengeBytes, err := outerChallenge.Marshal()
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshaling outer challenge: %w", err)
+	}
+
+	return outerChallengeBytes, privEncKeyBytes, nil
+}
+
+//---------------------------------------------------------
