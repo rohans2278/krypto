@@ -15,6 +15,8 @@ Rake::TestTask.new do |t|
   t.verbose = true
 end
 
+task test: :compile
+
 require "standard/rake"
 
 task default: %i[test standard]
