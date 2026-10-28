@@ -9,4 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 magnus = "0.9.3"
-hpke = { version = "0.14.1", default-features = false, features = ["mlkem", "x25519", "hkdfsha2", "aes", "getrandom", "alloc"] }
+op-crypto-internal-hpke = { git = "https://github.com/agilebits-inc/crypto", tag = "v0.2.0" }
+op-crypto-internal-provider = { git = "https://github.com/agilebits-inc/crypto", tag = "v0.2.0", features = ["aes-256-gcm", "hkdf", "random", "xwing"] }
+futures = "0.3"
