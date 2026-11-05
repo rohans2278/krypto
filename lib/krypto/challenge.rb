@@ -7,6 +7,7 @@ require "openssl"
 module Krypto
   # Limit size to prevent garbage from filling memory
   MAX_CHALLENGE_SIZE = 4 * 1024 * 1024
+  HPKE_RESPONSE_INFO = "x-wing-hpke-response"
 
   class Challenge
     def self.generate(signing_key, challenge_id, challenge_data, request_data, timestamp: Time.now)
@@ -30,6 +31,30 @@ module Krypto
 
       [outer, private_encryption_key.to_bytes]
     end
+
+    # ----------------------------------------------------------------------------
+    def self.generate_hpke(signing_key, challenge_id, challenge_data, request_data, timestamp: Time.now)
+      private_encryption_key, public_encryption_key = Krypto::HPKE.generate_key_pair
+
+      msg = MessagePack.pack(
+        InnerChallengeHPKE.new(
+          xwingPublicKey: public_encryption_key,
+          challengeData: challenge_data,
+          requestData: request_data,
+          timestamp: timestamp.to_i,
+          challengeId: challenge_id
+        )
+      )
+
+      outer = OuterChallenge.new(
+        sig: signing_key.sign(OpenSSL::Digest.new("SHA256"), msg),
+        msg: msg
+      )
+
+      [outer, private_encryption_key]
+    end
+
+    # ----------------------------------------------------------------------------
 
     def self.unmarshal(data, png: false, base64: true)
       # Limit size to prevent garbage from filling memory
@@ -56,6 +81,17 @@ module Krypto
 
         true
       end
+
+      # ----------------------------------------------------------------------------
+      def verify_hpke(key)
+        return false unless Krypto::Ec.verify(key, sig, msg)
+
+        @inner = InnerChallengeHPKE.new(MessagePack.unpack(msg))
+
+        true
+      end
+
+      # ----------------------------------------------------------------------------
 
       def timestamp
         @inner&.timestamp
@@ -106,6 +142,46 @@ module Krypto
           challengeId: @inner.challengeId
         )
       end
+
+      # ----------------------------------------------------------------------------
+      def respond_hpke(signing_key, signing_key_2, response_data)
+        raise "No inner. Unverified?" unless @inner
+        raise "not an hpke challenge. Use verify_hpke" unless @inner.is_a?(InnerChallengeHPKE)
+        raise "no hpke public encryption key in challenge" if @inner.xwingPublicKey.nil? || @inner.xwingPublicKey.empty?
+
+        public_signing_key_2_der = if !signing_key_2.nil?
+          Base64.strict_encode64(signing_key_2.public_to_der)
+        else
+          ""
+        end
+
+        msg = MessagePack.pack(
+          Krypto::ChallengeResponse::InnerResponse.new(
+            publicSigningKey: Base64.strict_encode64(signing_key.public_to_der),
+            publicSigningKey2: public_signing_key_2_der,
+            challengeData: @inner.challengeData,
+            responseData: response_data,
+            timestamp: Time.now.to_i
+          )
+        )
+
+        sig = Krypto::Ec.sign(signing_key, msg)
+
+        sig2 = if !signing_key_2.nil?
+          Krypto::Ec.sign(signing_key_2, msg)
+        else
+          ""
+        end
+
+        Krypto::ChallengeResponse::OuterResponseHPKE.new(
+          sig: sig,
+          sig2: sig2,
+          msg: Krypto::HPKE.seal(msg, @inner.xwingPublicKey, HPKE_RESPONSE_INFO),
+          challengeId: @inner.challengeId
+        )
+      end
+
+      # ----------------------------------------------------------------------------
     end
 
     INNER_CHALLENGE_FIELDS = %i[publicEncryptionKey challengeData requestData timestamp challengeId].freeze
@@ -114,5 +190,15 @@ module Krypto
         to_h.to_msgpack(out)
       end
     end
+
+    # ----------------------------------------------------------------------------
+    INNER_CHALLENGE_HPKE_FIELDS = %i[xwingPublicKey challengeData requestData timestamp challengeId].freeze
+    class InnerChallengeHPKE < Struct.new(*INNER_CHALLENGE_HPKE_FIELDS, keyword_init: true)
+      def to_msgpack(out = "")
+        to_h.to_msgpack(out)
+      end
+    end
+
+    # ----------------------------------------------------------------------------
   end
 end

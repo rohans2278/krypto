@@ -38,6 +38,36 @@ class TestKryptoChallenge < Minitest::Test
     validate_response(private_encryption_key, response)
   end
 
+  # ----------------------------------------------------------------------------
+  def test_challenge_hpke
+    challenge, private_encryption_key = ::Krypto::Challenge.generate_hpke(CHALLENGER_KEY, CHALLENGE_ID, CHALLENGE_DATA, REQUEST_DATA)
+
+    assert(challenge.verify_hpke(CHALLENGER_PUB))
+    assert_equal(REQUEST_DATA, challenge.request_data)
+
+    response = challenge.respond_hpke(RESPONDER_KEY, nil, RESPONDER_DATA)
+    validate_response(private_encryption_key, unmarshal_hpke_wire(response))
+
+    response = challenge.respond_hpke(RESPONDER_KEY, RESPONDER_KEY_2, RESPONDER_DATA)
+    validate_response(private_encryption_key, unmarshal_hpke_wire(response))
+
+    wrong_private_encryption_key, _ = ::Krypto::HPKE.generate_key_pair
+    assert_raises(RuntimeError) { unmarshal_hpke_wire(response).open(wrong_private_encryption_key) }
+
+    nacl_challenge, _ = ::Krypto::Challenge.generate(CHALLENGER_KEY, CHALLENGE_ID, CHALLENGE_DATA, REQUEST_DATA)
+    assert(nacl_challenge.verify(CHALLENGER_PUB))
+    assert_raises(RuntimeError) { nacl_challenge.respond_hpke(RESPONDER_KEY, nil, RESPONDER_DATA) }
+  end
+
+  # ----------------------------------------------------------------------------
+
+  # ----------------------------------------------------------------------------
+  def unmarshal_hpke_wire(response)
+    ::Krypto::ChallengeResponse.unmarshal_hpke(Base64.strict_encode64(MessagePack.pack(response)))
+  end
+
+  # ----------------------------------------------------------------------------
+
   def validate_response(private_encryption_key, response)
     # The challenger uses the challengeId to find the ephemeral encrytion key, and opens the response.
     assert_equal(CHALLENGE_ID, response.challengeId)
