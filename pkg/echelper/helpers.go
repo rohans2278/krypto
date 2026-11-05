@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hpke"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -75,6 +76,40 @@ func OpenNaCl(sealed []byte, counterPartyPublicKey, privateKey *[32]byte) ([]byt
 
 	return opened, nil
 }
+
+// ---------------------------------------------------------
+func SealHPKE(data []byte, counterPartyPublicKey []byte, info []byte) ([]byte, error) {
+	pub, err := hpke.MLKEM768X25519().NewPublicKey(counterPartyPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("parsing x-wing public key: %w", err)
+	}
+
+	sealed, err := hpke.Seal(pub, hpke.HKDFSHA256(), hpke.AES256GCM(), info, data)
+	if err != nil {
+		return nil, fmt.Errorf("sealing hpke box: %w", err)
+	}
+
+	return sealed, nil
+}
+
+//---------------------------------------------------------
+
+// ---------------------------------------------------------
+func OpenHPKE(sealed []byte, privateKey []byte, info []byte) ([]byte, error) {
+	priv, err := hpke.MLKEM768X25519().NewPrivateKey(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("parsing x-wing private key: %w", err)
+	}
+
+	opened, err := hpke.Open(priv, hpke.HKDFSHA256(), hpke.AES256GCM(), info, sealed)
+	if err != nil {
+		return nil, fmt.Errorf("opening hpke box: %w", err)
+	}
+
+	return opened, nil
+}
+
+//---------------------------------------------------------
 
 func PublicPemToEcdsaKey(keyBytes []byte) (*ecdsa.PublicKey, error) {
 	block, _ := pem.Decode(keyBytes)
